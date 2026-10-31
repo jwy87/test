@@ -24,7 +24,7 @@ VERSION="1.1.0"
 
 #── 仓库地址：上传 GitHub 后改成你的（公共仓库，main 分支）──────────────────
 # 也可不改文件、用环境变量临时指定：export MYVPS_REPO=https://raw.githubusercontent.com/<用户>/<仓库>/main
-REPO_BASE="${MYVPS_REPO:-https://raw.githubusercontent.com/你的用户名/你的仓库名/main}"
+REPO_BASE="${MYVPS_REPO:-https://raw.githubusercontent.com/jwy87/test/main}"
 
 MODULES="vps.sh tune.sh checkup.sh nettest.sh bench.sh"
 HOME_DIR="${MYVPS_HOME:-$HOME/.myvps}"
