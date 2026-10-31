@@ -15,6 +15,7 @@
 # 用法：
 #   ./tune.sh                 交互式菜单（推荐）
 #   ./tune.sh apply           应用调优（默认保守档，全程有确认）
+#   ./tune.sh apply --force    强制重新调优（忽略"已调优"检测）
 #   ./tune.sh apply --aggressive  激进档（大内存机器）
 #   ./tune.sh apply --bw 500 --rtt 50   手动指定带宽(Mbps)与RTT(ms)，跳过探测
 #   ./tune.sh status          查看当前调优状态
@@ -191,17 +192,58 @@ cmd_rollback(){
 }
 
 #── 应用调优 ─────────────────────────────────────────────────────────────────
+# initcwnd：首屏低延迟关键项；运行时设置，重启丢失（重跑 apply 自动补回）
+apply_initcwnd(){
+  is_container && return 1
+  ip route show default 2>/dev/null | grep -q . || return 1
+  local orig; orig=$(ip route show default | head -1)
+  # shellcheck disable=SC2086  # 路由参数必须按词拆分
+  if ip route change default ${orig#default} initcwnd 20 initrwnd 20 2>/dev/null; then
+    ok "initcwnd/initrwnd = 20"
+    return 0
+  fi
+  warn "initcwnd 设置失败（部分虚拟化不支持），已跳过"
+  return 1
+}
+
 cmd_apply(){
   need_root
-  local aggressive=0 bw="" rtt=""
+  local aggressive=0 bw="" rtt="" force=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --aggressive|-a) aggressive=1; shift ;;
       --bw) bw="$2"; shift 2 ;;
       --rtt) rtt="$2"; shift 2 ;;
+      --force|-f) force=1; shift ;;
       *) die "未知参数: $1" ;;
     esac
   done
+
+  #── 幂等检测：已调优时跳过重复调优（--force 强制重来）────────────────────
+  if [ -f "$SYSCTL_FILE" ] && [ "$force" != 1 ]; then
+    local tuned_at exp_cc cur_cc exp_rmem cur_rmem drift=0 ic_lost=0
+    tuned_at=$(grep -m1 '由 myvps tune' "$SYSCTL_FILE" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]+' | head -1)
+    ok "检测到已有调优配置${tuned_at:+（${tuned_at} 生成）}"
+    exp_cc=$(grep -m1 '^net.ipv4.tcp_congestion_control' "$SYSCTL_FILE" | awk '{print $3}')
+    exp_rmem=$(grep -m1 '^net.core.rmem_max' "$SYSCTL_FILE" | awk '{print $3}')
+    cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
+    [ -n "$exp_cc" ] && [ "$exp_cc" != "$cur_cc" ] && drift=1
+    [ -n "$exp_rmem" ] && [ "$exp_rmem" != "$cur_rmem" ] && drift=1
+    # initcwnd 是运行时设置，重启即丢（属正常）
+    if ! is_container && ip route show default 2>/dev/null | head -1 | grep -q 'initcwnd'; then :; else ic_lost=1; fi
+
+    if [ "$drift" = 1 ]; then
+      warn "检测到参数漂移（当前 cc=$cur_cc rmem=$cur_rmem ≠ 配置值），自动重新调优..."
+    elif [ "$ic_lost" = 1 ]; then
+      apply_initcwnd   # 只补回 initcwnd，不再全量重跑
+      ok "其余参数仍生效，已跳过重复调优（强制重调: ./tune.sh apply --force）"
+      return 0
+    else
+      ok "全部参数生效中，已跳过重复调优（强制重调: ./tune.sh apply --force）"
+      return 0
+    fi
+  fi
 
   local virt ram cores
   virt=$(detect_virt); ram=$(ram_mb); cores=$(core_n)
@@ -335,14 +377,7 @@ EOF
   done < "$SYSCTL_FILE"
 
   #── initcwnd（首屏低延迟；容器上通常改不了路由，静默跳过）──
-  if ! is_container && ip route show default 2>/dev/null | grep -q .; then
-    local orig; orig=$(ip route show default | head -1)
-    if ip route change default ${orig#default} initcwnd 20 initrwnd 20 2>/dev/null; then
-      ok "initcwnd/initrwnd = 20（重启后失效属正常，重跑 apply 即可）"
-    else
-      warn "initcwnd 设置失败（部分虚拟化不支持），已跳过"
-    fi
-  fi
+  apply_initcwnd
 
   echo
   if [ "$bad" -gt 0 ]; then

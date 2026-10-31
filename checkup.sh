@@ -130,6 +130,14 @@ if ! has sysctl && [ ! -d /proc/sys/net ]; then
 else
   kv "算法" "${CC:-未知}"
   kv "qdisc" "${QD:-未知}"
+  # 调优状态标记
+  local TUNE_CONF=/etc/sysctl.d/99-myvps-tune.conf
+  if [ -f "$TUNE_CONF" ]; then
+    local tdate; tdate=$(grep -m1 '由 myvps tune' "$TUNE_CONF" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
+    kv "调优状态" "${C_G}已调优${C_0}（myvps${tdate:+，$tdate}）"
+  else
+    kv "调优状态" "未调优（运行 tune.sh apply）"
+  fi
   if [ "${CC:-}" = bbr ]; then
     if [ "${BBR_V:-1}" = 3 ]; then
       kv "BBR 版本" "${C_G}v3${C_0}"
