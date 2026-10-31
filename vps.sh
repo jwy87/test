@@ -4,9 +4,10 @@
 #
 # 子命令：
 #   ./vps.sh            交互菜单
-#   ./vps.sh auto       ★一条龙：体检 → 调优 → 回程 → 到你省份三网（全自动）
+#   ./vps.sh auto       ★一条龙：体检 → 调优 → 安全加固 → 回程 → 到你省份三网
 #   ./vps.sh all        一条龙（带确认的开荒流程）
 #   ./vps.sh tune       网络调优（BBR/fq/BDP 缓冲/initcwnd，含回滚）
+#   ./vps.sh secure     安全加固（一键：更新+防爆破+SSH加固，不锁门）
 #   ./vps.sh kernel     可选：安装 BBRv3 内核（需重启）
 #   ./vps.sh check      60 秒体检
 #   ./vps.sh net        三网延迟矩阵 + 回程线路
@@ -26,7 +27,7 @@ VERSION="1.1.0"
 # 也可不改文件、用环境变量临时指定：export MYVPS_REPO=https://raw.githubusercontent.com/<用户>/<仓库>/main
 REPO_BASE="${MYVPS_REPO:-https://raw.githubusercontent.com/jwy87/test/main}"
 
-MODULES="vps.sh tune.sh checkup.sh nettest.sh bench.sh"
+MODULES="vps.sh tune.sh checkup.sh nettest.sh bench.sh secure.sh"
 HOME_DIR="${MYVPS_HOME:-$HOME/.myvps}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 DIR=""
@@ -53,7 +54,7 @@ dl(){ # dl <url> <out>
 #── 定位模块目录：同目录齐全用本地的；curl 管道运行则从仓库补齐 ─────────────
 resolve_dir(){
   local m ok=1
-  for m in tune.sh checkup.sh nettest.sh bench.sh; do
+  for m in tune.sh checkup.sh nettest.sh bench.sh secure.sh; do
     [ -f "$SCRIPT_DIR/$m" ] || { ok=0; break; }
   done
   if [ "$ok" = 1 ]; then DIR="$SCRIPT_DIR"; return 0; fi
@@ -87,15 +88,18 @@ mode_auto(){
   local with_bench=0
   case "${1:-}" in --bench|bench) with_bench=1;; esac
   echo
-  echo "${C_BOLD}═══ 新机一条龙：体检 → 调优 → 三网(含到你省份) ═══${C_0}"
+  echo "${C_BOLD}═══ 新机一条龙：体检 → 调优 → 安全加固 → 三网(含到你省份) ═══${C_0}"
   if [ "$(id -u)" != 0 ]; then
-    warn "非 root：体检/三网照常，调优将跳过（之后可: sudo bash $DIR/tune.sh apply）"
+    warn "非 root：体检/三网照常，调优与安全加固将跳过（之后可: sudo bash $DIR/vps.sh auto）"
   else
     # 带宽探测质量：无 iperf3 时静默补装（失败不影响，探测会退回默认值）
     has iperf3 || has apt-get && apt-get install -y -qq iperf3 >/dev/null 2>&1 || true
   fi
   bash "$DIR/checkup.sh"
-  [ "$(id -u)" = 0 ] && bash "$DIR/tune.sh" apply
+  if [ "$(id -u)" = 0 ]; then
+    bash "$DIR/tune.sh" apply
+    bash "$DIR/secure.sh" auto --yes
+  fi
   bash "$DIR/nettest.sh" route
   bash "$DIR/nettest.sh" home || true   # 省份识别失败不影响整体
   if [ "$with_bench" = 1 ]; then
@@ -152,22 +156,23 @@ menu(){
   echo
   echo "${C_BOLD}╔════════════════════════════════════════════╗${C_0}"
   echo "${C_BOLD}║        专属 VPS 工具箱  v$VERSION             ║${C_0}"
-  echo "${C_BOLD}║        调优 · 体检 · 测评 · 三网             ║${C_0}"
+  echo "${C_BOLD}║     调优 · 体检 · 加固 · 测评 · 三网        ║${C_0}"
   echo "${C_BOLD}╚════════════════════════════════════════════╝${C_0}"
   echo
   echo "  ${C_BOLD}常用${C_0}"
-  echo "   1) 一条龙(自动)  体检 → 调优 → 三网（新机首选）"
+  echo "   1) 一条龙(自动)  体检 → 调优 → 加固 → 三网（新机首选）"
   echo "   2) 网络调优      BBR/fq/BDP缓冲/initcwnd（可回滚）"
-  echo "   3) 60 秒体检     系统/IP双栈/BBR/三网延迟"
+  echo "   3) 安全加固      一键：更新+防爆破+SSH加固（不锁门不封端口）★"
+  echo "   4) 60 秒体检     系统/IP双栈/BBR/三网延迟"
   echo
   echo "  ${C_BOLD}测评${C_0}"
-  echo "   4) 综合测评      融合怪/IP质量/解锁/单线程测速"
-  echo "   5) 三网测试      延迟矩阵 + 回程线路判定"
-  echo "   6) 到我省份★    自动识别你的省份，测 VPS→你家三网延迟"
+  echo "   5) 综合测评      融合怪/IP质量/解锁/单线程测速"
+  echo "   6) 三网测试      延迟矩阵 + 回程线路判定"
+  echo "   7) 到我省份★    自动识别你的省份，测 VPS→你家三网延迟"
   echo
   echo "  ${C_BOLD}进阶${C_0}"
-  echo "   7) BBRv3 内核    可选安装（需重启，先看说明）"
-  echo "   8) 装为系统命令  vps"
+  echo "   8) BBRv3 内核    可选安装（需重启，先看说明）"
+  echo "   9) 装为系统命令  vps"
   echo "   0) 退出"
   echo
   printf '选择: '
@@ -175,12 +180,13 @@ menu(){
   case "$sel" in
     1) mode_auto ;;
     2) run_mod tune.sh ;;
-    3) run_mod checkup.sh ;;
-    4) run_mod bench.sh ;;
-    5) run_mod nettest.sh ;;
-    6) run_mod nettest.sh home ;;
-    7) run_mod tune.sh kernel ;;
-    8) mode_install ;;
+    3) run_mod secure.sh ;;
+    4) run_mod checkup.sh ;;
+    5) run_mod bench.sh ;;
+    6) run_mod nettest.sh ;;
+    7) run_mod nettest.sh home ;;
+    8) run_mod tune.sh kernel ;;
+    9) mode_install ;;
     *) exit 0 ;;
   esac
   done
@@ -197,6 +203,7 @@ case "$CMD" in
   auto)      mode_auto "${2:-}" ;;
   all)       mode_all ;;
   tune)      run_mod tune.sh "${@:2}" ;;
+  secure)    run_mod secure.sh "${@:2}" ;;
   kernel)    run_mod tune.sh kernel ;;
   check)     run_mod checkup.sh "${@:2}" ;;
   net)       run_mod nettest.sh "${@:2}" ;;

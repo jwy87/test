@@ -1,7 +1,7 @@
 # 专属 VPS 工具箱（搭节点向）
 
-> 调优 · 体检 · 测评 · 三网 —— 为「稳定 / 高速 / 低延迟」搭节点场景整合
-> 所有上游项目与事实结论均于 **2026-10-31** 逐一验证
+> 调优 · 体检 · 安全加固 · 测评 · 三网 —— 为「稳定 / 高速 / 低延迟」搭节点场景整合
+> 所有上游项目与事实结论均于 **2026-10-31** 逐一验证（安全模块 2026-11-01）
 
 ---
 
@@ -9,7 +9,7 @@
 
 **第 1 步：上传**（任选其一）
 
-- GitHub 网页：新建**公共**仓库（如 `myvps`）→ 上传这 5 个 `.sh` 文件（README.md 可选）→ 默认分支用 `main`
+- GitHub 网页：新建**公共**仓库（如 `myvps`）→ 上传这 6 个 `.sh` 文件（README.md 可选）→ 默认分支用 `main`
 - 或命令行：
   ```bash
   cd D:/4/SSH/myvps
@@ -56,8 +56,9 @@ bash ~/.myvps/vps.sh install   # 装为系统命令，以后直接敲: vps
 
 | 文件 | 功能 | 改系统？ | 耗时 |
 |---|---|---|---|
-| `vps.sh` | 统一入口菜单（也可直接跑下面四个） | - | - |
+| `vps.sh` | 统一入口菜单（也可直接跑下面五个） | - | - |
 | `tune.sh` | 网络调优：BBR/fq/BDP 缓冲/initcwnd，快照+回滚 | ✅（可回滚） | 1-2 分钟 |
+| `secure.sh` | 安全加固：更新/防爆破/SSH 加固，事务式改配置 | ✅（可回滚） | 2-5 分钟 |
 | `checkup.sh` | 60 秒体检：系统/IP双栈/BBR/三网延迟/健康 | ❌ 只读 | 30-60 秒 |
 | `nettest.sh` | 三网延迟矩阵（京沪穗蓉 v4+v6）+ 回程线路判定 | ❌（装 backtrace 到 /usr/local/bin） | 1-2 分钟 |
 | `bench.sh` | 综合测评：融合怪/IP质量/解锁/单线程双栈测速 | ❌（装 goecs） | 按模块 20秒-30分钟 |
@@ -74,7 +75,7 @@ bash vps.sh            # 菜单
 bash vps.sh auto       # 一条龙：体检→调优→三网（新机首选）
 ```
 
-> checkup / nettest / bench / tune 四个模块脚本**相互独立**，单独 scp 上去也能直接跑。
+> checkup / nettest / bench / tune / secure 五个模块脚本**相互独立**，单独 scp 上去也能直接跑。
 
 ---
 
@@ -156,6 +157,39 @@ bash bench.sh net      # 仅网络 / ip 仅IP质量 / media 解锁 / hw 硬件 /
 
 **为什么单线程测速不用 Ookla？** 官方 CLI 没有 `--single-thread` 参数（1.2.0 二进制+手册双重核实）；sivel/speedtest-cli 已归档（2024-07）；HyperSpeed 已死（git.io 关停+仓库删除）。iperf3 单流收发是 NodeQuality 内部 Net.Check.Place 的实际做法，也是社区"单线程压测"的当前标准实现。
 
+### 5. secure.sh — 安全加固（小白友好）
+
+```bash
+bash secure.sh              # 菜单
+bash secure.sh auto         # ★一键加固（零锁门风险，不封任何端口）
+bash secure.sh check        # 安全体检（只读）
+bash secure.sh key          # 添加 SSH 公钥（防误粘私钥，自动校验指纹）
+bash secure.sh nokey        # 禁用密码登录（三重验证门）
+bash secure.sh port         # 修改 SSH 端口（双端口过渡）
+bash secure.sh ufw          # 防火墙（先放行 SSH 和在监听端口）
+bash secure.sh ufw-open 443 # 装好节点后放行端口（tcp+udp）
+bash secure.sh rollback     # 回滚对 SSH 的全部修改
+```
+
+**一键加固做了什么**（幂等，重复运行显示"已配置"并跳过）：
+
+| 步骤 | 内容 | 说明 |
+|---|---|---|
+| 系统更新 | `apt update + upgrade` | 首次可能几分钟 |
+| 自动安全补丁 | unattended-upgrades | 每天只装 security 源补丁 |
+| 防暴力破解 | fail2ban（错 5 次封 1 小时） | 监听实际 SSH 端口，改端口自动同步 |
+| SSH 基础加固 | 禁空密码/限认证 5 次/登录窗口 60s/连接保活 | **不碰**端口/root登录/密码登录 |
+
+**安全设计**（抄自 tansir v10.1.0 的验证模式，2026-11 核对）：
+
+- **绝不锁门**：所有 SSH 修改走「备份 → 写入 → `sshd -t` 语法校验 → reload → 生效校验」，任何一步失败自动还原；备份存 `/var/lib/myvps-secure/`
+- **禁密码三重门**：① root 必须已有公钥 ② 必须人工确认"已在新窗口用密钥登录成功" ③ 生效后校验实际配置，不符自动回滚
+- **改端口双端口过渡**：新旧端口同时监听 → 你新开窗口验证 → 再回来关旧端口（同时处理 Ubuntu 24.10+ 的 ssh.socket 模式，否则改端口不生效）；改前若 UFW 启用先放行新端口
+- **防火墙不弄断节点**：启用前自动放行 SSH 端口 + 所有正在监听的服务端口；装好新节点后 `secure.sh ufw-open 端口` 补放行
+- **云安全组提醒**：阿里云/腾讯云等控制台的安全组是另一层，脚本会提示同步
+
+**推荐顺序**：一键加固 → 配密钥（菜单 3）→ 新窗口验证密钥 → 禁密码（菜单 4）→ 装节点 → 防火墙（菜单 6）。
+
 ---
 
 ## 关于 BBRv3 的实话（重要）
@@ -210,4 +244,8 @@ bash tune.sh rollback   # 恢复全部 sysctl 快照 + initcwnd 默认 + 删配�
 - [nxtrace/NTrace-core](https://github.com/nxtrace/NTrace-core) — NextTrace
 - [byJoey/Actions-bbr-v3](https://github.com/byJoey/Actions-bbr-v3)、[XanMod](https://xanmod.org/) — BBRv3 内核
 - [lmc999/RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck) — 流媒体解锁
+- [tansir-1/vps-security-bootstrap](https://github.com/tansir-1/vps-security-bootstrap) v10.1.0 — SSH 事务备份/校验/回滚与验证门模式（SHA256 核对后源码级参考）
+- [gnafehefang/VPS-QuickSetup](https://github.com/gnafehefang/VPS-QuickSetup) — 双端口过渡、新窗口验证流程
+- [Lynthar/CloudServer-Audit](https://github.com/Lynthar/CloudServer-Audit) — 审计项清单参考（其 20 模块框架对个人 VPS 过重，未采用）
+- pyxia.org/secure.sh — 已无法访问（DNS 失效），未能参考
 - 参考过的 NodeQuality / SpeedQuality（其结果上传行为已在本工具箱中规避）
