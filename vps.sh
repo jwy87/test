@@ -7,6 +7,8 @@
 #   ./vps.sh auto       ★一条龙：体检 → 调优 → 安全加固 → 回程 → 到你省份三网
 #   ./vps.sh all        一条龙（带确认的开荒流程）
 #   ./vps.sh tune       网络调优（BBR/fq/BDP 缓冲/initcwnd，含回滚）
+#   ./vps.sh v6         IPv6 专项（纯 v6/双栈机：出口稳定 + DNS/NAT64）
+#   ./vps.sh swap       swap 兜底（小内存机推荐大小，回车即开，防 OOM）
 #   ./vps.sh secure     安全加固（一键：更新+防爆破+SSH加固，不锁门）
 #   ./vps.sh kernel     可选：安装 BBRv3 内核（需重启）
 #   ./vps.sh skyline    可选：Skyline 加速（高丢包普线，内核≥6.12，无需重启）
@@ -99,11 +101,17 @@ mode_auto(){
   bash "$DIR/checkup.sh"
   if [ "$(id -u)" = 0 ]; then
     bash "$DIR/tune.sh" apply
+    # 纯 v6 / 双栈机：自动追加 v6 专项优化（非交互确认由用户自行决定，这里只提示）
+    if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+      echo
+      info "检测到 IPv6 全局地址：建议跑 vps v6 做出口稳定优化（纯 v6 机尤其推荐）"
+    fi
     bash "$DIR/secure.sh" auto --yes
   fi
   bash "$DIR/nettest.sh" route
   bash "$DIR/nettest.sh" home || true   # 省份识别失败不影响整体
   if [ "$with_bench" = 1 ]; then
+    # 限额环境变量透传（MYVPS_CPU/MYVPS_MEM/MYVPS_NOLIMIT 在 bench.sh 内生效）
     bash "$DIR/bench.sh" all
   else
     echo
@@ -172,9 +180,11 @@ menu(){
   echo "   7) 到我省份★    自动识别你的省份，测 VPS→你家三网延迟"
   echo
   echo "  ${C_BOLD}进阶${C_0}"
-  echo "   8) BBRv3 内核    可选安装（需重启，先看说明）"
-  echo "   9) Skyline 加速  高丢包普线专用（内核≥6.12，无需重启）"
-  echo "  10) 装为系统命令  vps"
+  echo "   8) IPv6 专项      纯 v6/双栈机：出口稳定 + DNS/NAT64（可回滚）"
+  echo "   9) swap 兜底      小内存机推荐大小，回车即开（防 OOM 杀进程）"
+  echo "  10) BBRv3 内核    可选安装（需重启，先看说明）"
+  echo "  11) Skyline 加速  高丢包普线专用（内核≥6.12，无需重启）"
+  echo "  12) 装为系统命令  vps"
   echo "   0) 退出"
   echo
   printf '选择: '
@@ -187,9 +197,11 @@ menu(){
     5) run_mod bench.sh ;;
     6) run_mod nettest.sh ;;
     7) run_mod nettest.sh home ;;
-    8) run_mod tune.sh kernel ;;
-    9) run_mod tune.sh skyline ;;
-    10) mode_install ;;
+    8) run_mod tune.sh v6 ;;
+    9) run_mod tune.sh swap ;;
+    10) run_mod tune.sh kernel ;;
+    11) run_mod tune.sh skyline ;;
+    12) mode_install ;;
     *) exit 0 ;;
   esac
   done
@@ -206,6 +218,8 @@ case "$CMD" in
   auto)      mode_auto "${2:-}" ;;
   all)       mode_all ;;
   tune)      run_mod tune.sh "${@:2}" ;;
+  v6)        run_mod tune.sh v6 ;;
+  swap)      run_mod tune.sh swap ;;
   secure)    run_mod secure.sh "${@:2}" ;;
   kernel)    run_mod tune.sh kernel ;;
   skyline)   run_mod tune.sh skyline ;;

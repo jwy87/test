@@ -107,7 +107,8 @@ do_ping(){
 #── Part 2: 到你省份的个性化延迟 ─────────────────────────────────────────────
 # 识别 SSH 来源 IP 所在省份（ip-api.com 免费 API，中文返回；跳板机场景请手动指定）
 detect_province(){
-  local src_ip="${SSH_CONNECTION%% *}" prov=""
+  local src_ip prov=""
+  src_ip="${SSH_CONNECTION:-}"; src_ip="${src_ip%% *}"
   [ -n "$src_ip" ] || { echo ""; return; }
   has curl || { echo ""; return; }
   prov=$(curl -s --max-time 6 "http://ip-api.com/json/${src_ip}?lang=zh-CN&fields=status,regionName" 2>/dev/null \
@@ -160,7 +161,8 @@ do_home(){
   echo "${C_BOLD}── 到你所在省份的三网延迟（个性化）──${C_0}"
   # 省份：参数优先 → SSH 来源自动识别
   if [ -z "$prov" ]; then
-    local src_ip="${SSH_CONNECTION%% *}"
+    local src_ip=""
+    src_ip="${SSH_CONNECTION:-}"; src_ip="${src_ip%% *}"
     [ -n "$src_ip" ] && info "SSH 来源 IP: $src_ip"
     prov=$(detect_province)
     if [ -n "$prov" ]; then

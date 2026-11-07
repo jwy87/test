@@ -93,7 +93,11 @@ bash tune.sh verify             # 校验参数是否生效
 bash tune.sh rollback           # 一键回滚到调优前
 bash tune.sh kernel             # 可选：装 BBRv3 内核（见下文）
 bash tune.sh skyline            # 可选：Skyline 加速（见下文）
+bash tune.sh v6                 # IPv6 专项（见下文 v6 章节）
+bash tune.sh swap               # swap 助手：推荐大小，回车即开
 ```
+
+**小内存机 OOM 兜底**：`apply` 结尾检测到 ≤1GB 内存且无 swap 时自动进入 swap 助手——按内存推荐 2GB（磁盘可用不足 4GB 时减半封顶），回车即创建 `/swapfile` 并写 fstab。容器里失败（宿主禁 swap）会清理残留并说明原因。
 
 **它做了什么**（全部写入 `/etc/sysctl.d/99-myvps-tune.conf`，逐项试写、不支持自动注释）：
 
@@ -121,6 +125,8 @@ bash checkup.sh            # 全部
 bash checkup.sh --no-ping  # 跳过大陆延迟（离线场景）
 ```
 
+有 IPv6 的机器额外输出 **v6 深度体检**：全局地址数/SLAAC 判定、公网连通性（有地址≠真通）、AAAA 解析、隐私扩展（出口 IP 稳定性）、MTU（隧道环境提示）。纯 v6 机器不再误报 IPv4 红字、自动跳过 v4 延迟表。
+
 ### 3. nettest.sh — 三网延迟 + 回程 + 到你省份
 
 ```bash
@@ -145,7 +151,13 @@ bash bench.sh          # 菜单
 bash bench.sh all      # 日常组合：IP质量 + 单线程双栈（约4分钟）★推荐
 bash bench.sh full     # 融合怪完全体（7-30分钟）
 bash bench.sh net      # 仅网络 / ip 仅IP质量 / media 解锁 / hw 硬件 / single 测速
+# CPU/内存受限套餐（如 CPU 峰值≤30%）——限额跑，评测进程树不超限:
+bash bench.sh --low-power full            # 默认 CPU≤25% 内存≤512MB
+MYVPS_CPU=30 MYVPS_MEM=400 bash bench.sh full   # 自定义限额
+MYVPS_NOLIMIT=1 bash bench.sh full        # 彻底禁用所有限额
 ```
+
+**限额原理**：`systemd-run --scope` 事务性 cgroup（CPUQuota + MemoryMax），跑完自动清理不留系统状态；无 systemd 的环境自动降级为 nice 10 + ionice（软限制）。限额模式下 `hw` 硬件跑分数字会偏低（受限是真的，但分数别拿去跟人对比）。
 
 | 模块 | 上游 | 状态 |
 |---|---|---|
@@ -229,10 +241,23 @@ bash secure.sh rollback     # 回滚对 SSH 的全部修改
 
 **与本工具箱的配合**（tune.sh 已内置，无需操心）：Skyline 启用时接管 CC/qdisc 并守住设置；tune.sh 检测到 `ACCELERATING` 状态会自动跳过 CC/qdisc 项（缓冲区 BDP 推导、initcwnd 等其余调优照常叠加），verify 也不误报。一键卸载后重跑 `tune.sh apply --force` 即恢复 bbr+fq。装完只对新连接生效，测试记得重连。
 
+## IPv6 专项（主打 v6 的 VPS）
+
+`bash tune.sh v6` / `vps v6`——针对 v6-only 或双栈机（2026-11 新增，Alpine LXC 实测驱动）：
+
+- **checkup 体检**：v6 全局地址/SLAAC 判定、公网连通性（有地址≠真通公网）、AAAA 解析、隐私扩展、MTU。纯 v6 机不误报 v4 红字、跳过 v4 延迟表
+- **tune v6 优化**（`/etc/sysctl.d/99-myvps-v6.conf`，`v6 --rollback` 可回滚）：
+  - `use_tempaddr=0` 关隐私扩展——出口 IP 稳定（代理节点/白名单关键，临时地址会轮换导致被封）
+  - `disable_ipv6=0` 防云镜像静默关 v6
+  - `accept_ra=2` 开着 forwarding 也接受 RA（防上游抖动掉地址）
+  - DNS AAAA 体检 + 纯 v6 机的 NAT64/DNS64 兜底提示（v4-only 服务如 Docker Hub 需要它）
+- **nettest**：`home` 模式对 v6 目标照常测；延迟矩阵有 v4/v6 双表
+
 ## 回滚
 
 ```bash
-bash tune.sh rollback   # 恢复全部 sysctl 快照 + initcwnd 默认 + 删配置文件
+bash tune.sh rollback        # 恢复全部 sysctl 快照 + initcwnd 默认 + 删配置文件
+bash tune.sh v6 --rollback   # 恢复 v6 专项参数
 ```
 
 - 快照保存在 `/var/lib/myvps-tune/pre-tune.snapshot`（第一次调优前的原始值）

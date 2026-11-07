@@ -24,6 +24,8 @@
 #   ./tune.sh rollback        回滚到调优前快照
 #   ./tune.sh kernel          可选：安装 BBRv3 内核（明确提示需重启）
 #   ./tune.sh skyline         可选：Skyline Speeder 高丢包线路加速（eBPF，需内核≥6.12）
+#   ./tune.sh v6              IPv6 专项优化（纯 v6 / 双栈机，地址/DNS/MTU/隐私扩展）
+#   ./tune.sh swap            swap 助手：小内存机自动推荐大小，回车即开（防 OOM）
 #   ./tune.sh verify          校验当前参数是否生效
 #=============================================================================
 set -uo pipefail
@@ -83,7 +85,8 @@ skyline_is_on(){
 
 # 从 SSH 连接目标实测 RTT；连不上/无 ping 返回默认 180ms（跨海典型值）
 guess_rtt(){
-  local dst="${SSH_CONNECTION%% *}" r=""
+  local dst r=""
+  dst="${SSH_CONNECTION:-}"; dst="${dst%% *}"
   [ -n "$dst" ] || { echo 180; return; }
   command -v ping >/dev/null 2>&1 || { echo 180; return; }
   r=$(ping -c 3 -q -W 3 "$dst" 2>/dev/null | awk -F'/' '/rtt|round-trip/{printf "%d", $5}')
@@ -407,9 +410,63 @@ EOF
     ok "调优完成: $SYSCTL_FILE"
   fi
   echo "  查看状态: ./tune.sh status    回滚: ./tune.sh rollback"
-  [ "$ram" -le 1024 ] && ! swapon --show 2>/dev/null | grep -q . && {
-    warn "小内存(${ram}MB)无 swap：TCP 缓冲高水位时代理进程可能被 OOM 杀，建议加 1-2G swap"
-  }
+  # 小内存无 swap：直接引导进 swap 助手（回车=开，推荐值自动算好）
+  if [ "$ram" -le 1024 ] && ! swapon --show 2>/dev/null | grep -q .; then
+    cmd_swap
+  fi
+}
+
+#── swap 助手：小内存机自动推荐大小，回车即开 ───────────────────────────────
+# 推荐：内存 ≤1G → 2G swap；≤2G → 2G；更大不加（代理节点不需要）
+# 封顶：不超过磁盘可用空间的一半（小盘机保护）；绝对不碰已有的 swap
+cmd_swap(){
+  local ram avail_gb rec_gb
+  ram=$(ram_mb)
+  # /proc/meminfo 的 SwapTotal 对容器显示的是宿主的，用 swapon 判断真实
+  if swapon --show 2>/dev/null | grep -q .; then
+    ok "已有 swap（swapon --show 可看），无需处理"
+    return 0
+  fi
+  # df 列序不固定（挂载点可能带空格），从右找第一个"纯数字G"的字段 = Available
+  avail_gb=$(df -BG / 2>/dev/null | awk 'NR==2{for(i=NF;i>=1;i--){if($i ~ /^[0-9]+G$/){gsub("G","",$i);print $i; exit}}}')
+  case "$avail_gb" in ''|*[!0-9]*) avail_gb=1 ;; esac
+  # 推荐大小：小内存机推荐 2G；磁盘可用不足 4G 时按一半封顶（至少 1G）
+  rec_gb=2
+  if [ "$avail_gb" -lt 4 ]; then
+    rec_gb=$(( avail_gb / 2 ))
+    [ "$rec_gb" -lt 1 ] && rec_gb=1
+  fi
+  echo
+  echo "${C_BOLD}── swap 内存兜底 ──${C_0}"
+  echo "  内存 ${ram}MB，无 swap —— 高负载时代理进程可能被 OOM 直接杀掉"
+  echo "  推荐 swap 大小: ${C_BOLD}${rec_gb}GB${C_0}（磁盘 / 可用 ${avail_gb}GB）"
+  echo "  swap 文件: /swapfile，Swappiness 保持默认（不抢内存，只做兜底）"
+  printf '%s 创建并启用? [Enter=开/其他=跳过] '
+  read -r ans || ans=""
+  [ -n "$ans" ] && { info "已跳过（想用时随时: ./tune.sh swap）"; return 0; }
+  if [ -f /swapfile ]; then
+    warn "/swapfile 已存在但未启用——先检查: swapon --show、free -m"
+    return 1
+  fi
+  # 容器里的 swap 需要宿主允许（多数 PVE LXC 模板默认禁）——先试再报
+  if fallocate -l "${rec_gb}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((rec_gb*1024)) status=none 2>/dev/null; then
+    chmod 600 /swapfile
+    if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+      # 开机自动挂载（容器里 fstab 的 swap 由宿主忽略，无害）
+      grep -q '^/swapfile' /etc/fstab 2>/dev/null || \
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+      ok "swap 已启用: ${rec_gb}GB（free -m 查看；已写入 fstab 开机自动挂）"
+      is_container && warn "LXC/容器环境：若重启后 swap 消失，是宿主模板禁了容器 swap（PVE 面板可开）"
+      return 0
+    fi
+    # 失败清理干净
+    rm -f /swapfile
+    warn "swapon 被拒绝——多数是容器宿主禁了 swap（PVE LXC 需宿主侧开启），已清理残留文件"
+    return 1
+  fi
+  rm -f /swapfile
+  warn "磁盘空间不足，swap 创建失败（已清理）"
+  return 1
 }
 
 #── 状态 ─────────────────────────────────────────────────────────────────────
@@ -597,6 +654,120 @@ cmd_skyline(){
   echo "  缓冲区（BDP）/initcwnd 等其余调优照常叠加生效。卸载它后重跑 ./tune.sh apply 恢复 bbr+fq。"
 }
 
+#── IPv6 专项优化（纯 v6 / 双栈机通用）──────────────────────────────────────
+# 面向"主打 v6 的 VPS"（如 v6-only 套餐）：不装任何东西，只调 sysctl。
+# 设计原则与 apply 一致：可回滚、逐项试写、拒绝的自动注释。
+V6_SYSCTL_FILE="/etc/sysctl.d/99-myvps-v6.conf"
+V6_TUNED_KEYS="
+net.ipv6.conf.all.use_tempaddr
+net.ipv6.conf.default.use_tempaddr
+net.ipv6.conf.all.disable_ipv6
+net.ipv6.conf.default.disable_ipv6
+net.ipv6.conf.all.accept_ra
+net.ipv6.conf.default.accept_ra
+net.ipv6.conf.all.forwarding
+net.ipv6.conf.default.forwarding
+"
+v6_snapshot(){
+  mkdir -p "$STATE_DIR"
+  [ -f "$STATE_DIR/pre-v6.snapshot" ] && return 0
+  local k v; : > "$STATE_DIR/pre-v6.snapshot"
+  while IFS= read -r k; do
+    [ -z "$k" ] && continue
+    v=$(sysctl -n "$k" 2>/dev/null) || continue
+    printf '%s=%s\n' "$k" "$v" >> "$STATE_DIR/pre-v6.snapshot"
+  done <<< "$V6_TUNED_KEYS"
+}
+v6_rollback(){
+  [ -f "$STATE_DIR/pre-v6.snapshot" ] || { info "无 v6 快照（未做过 v6 优化）"; return 0; }
+  local k v n=0
+  while IFS='=' read -r k v; do
+    sysctl -qw "$k=$v" 2>/dev/null && n=$((n+1))
+  done < "$STATE_DIR/pre-v6.snapshot"
+  rm -f "$V6_SYSCTL_FILE" "$STATE_DIR/pre-v6.snapshot"
+  ok "已回滚 $n 项 v6 参数，配置文件已删除"
+}
+cmd_v6(){
+  need_root
+  echo "${C_BOLD}── IPv6 专项优化 ──${C_0}"
+  echo
+  # 环境确认：没有 v6 地址就别瞎调
+  if ! ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    warn "本机无 IPv6 全局地址（纯 v4 机器不需要本项）"
+    printf '%s 仍要继续? [y/N] '
+    read -r ans || ans=n
+    case "$ans" in [Yy]*) ;; *) info "已取消"; return 0 ;; esac
+  fi
+  local slaac=0
+  slaac=$(ip -6 addr show scope global 2>/dev/null | grep -c 'mngtmpaddr\|dynamic')
+  # MTU：隧道环境（<1500）提示（tcp_mtu_probing 已由 apply 设 1）
+  local mtu; mtu=$(ip -6 route show default 2>/dev/null | grep -o 'mtu [0-9]*' | awk '{print $2}' | head -1)
+  [ -n "$mtu" ] && [ "$mtu" -lt 1500 ] && warn "v6 默认路由 MTU=$mtu（隧道环境）：tcp_mtu_probing 已由 apply 设为 1，大包会自动探测协商"
+
+  echo "  将要做的事（全部可回滚: ./tune.sh v6 --rollback）："
+  echo "   1. use_tempaddr=0   关隐私扩展——出口 IP 稳定（代理节点/白名单场景关键）"
+  echo "   2. disable_ipv6=0   确保双栈机的 v6 没被云镜像静默关掉"
+  echo "   3. accept_ra=2      开着 forwarding 也接受 RA（防上游抖动掉地址）"
+  echo "   4. DNS 体检          确认能解析 AAAA（纯 v6 机常见坑：DNS 只走 v4）"
+  echo "   5. v4 兜底           纯 v6 机提示 NAT64/DNS64 兜底 v4-only 服务"
+  echo
+  printf '%s 应用? [Y/n] '
+  read -r ans || ans=y
+  case "${ans:-y}" in [Nn]*) info "已取消"; return 0 ;; esac
+
+  v6_snapshot
+
+  local tmp; tmp=$(mktemp "${V6_SYSCTL_FILE}.XXXXXX") || die "无法创建临时文件"
+  cat > "$tmp" <<EOF
+# 由 myvps tune v$VERSION v6 生成 $(date '+%F %T')
+# 目的：IPv6 出口稳定（关临时地址轮换）+ 防 v6 被静默禁用
+net.ipv6.conf.all.use_tempaddr = 0
+net.ipv6.conf.default.use_tempaddr = 0
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.default.disable_ipv6 = 0
+# accept_ra=2：即使 forwarding 开着也接受 RA（KVM 网桥 + 未来开转发都稳）
+net.ipv6.conf.all.accept_ra = 2
+net.ipv6.conf.default.accept_ra = 2
+# myvps-v6-end
+EOF
+  grep -qx '# myvps-v6-end' <(tail -1 "$tmp") || { rm -f "$tmp"; die "配置生成不完整"; }
+  chmod 644 "$tmp" && mv -f "$tmp" "$V6_SYSCTL_FILE"
+
+  # 逐项试写（容器里 v6 sysctl 常被拒，注释跳过）
+  local bad=0 line k v
+  while IFS= read -r line; do
+    case "$line" in \#*|'') continue;; esac
+    k=$(printf '%s' "${line%%=*}" | tr -d ' \t')
+    v=$(printf '%s' "${line#*=}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    if ! sysctl -qw "$k=$v" 2>/dev/null; then
+      sed -i "s%^[[:space:]]*${k}[[:space:]]*=%# 本机不支持: ${k} =%" "$V6_SYSCTL_FILE"
+      warn "  不支持或被拒绝: ${k} —— 已注释"
+      bad=$((bad+1))
+    fi
+  done < "$V6_SYSCTL_FILE"
+
+  # DNS AAAA 解析体检（只读）
+  echo
+  if command -v getent >/dev/null 2>&1; then
+    if getent ahosts v6.test-ipv6.com 2>/dev/null | grep -q .; then
+      ok "DNS AAAA 解析正常"
+    else
+      warn "AAAA 解析失败：纯 v6 机请检查 /etc/resolv.conf 有没有 v6 可达的 DNS"
+      echo "    可加: nameserver 2001:4860:4860::8888（Google v6 DNS）"
+    fi
+  fi
+  # 纯 v6 机的 v4 兜底提示
+  if ! ip -4 route show default 2>/dev/null | grep -q .; then
+    warn "纯 IPv6 机器：部分 v4-only 服务（Docker Hub 等）会失败，NAT64 兜底："
+    echo "    resolv.conf 的 DNS 换成 DNS64 服务器即可自动翻译 v4 地址:"
+    echo "    nameserver 2602:fc59::10  （Public NAT64+DNS64，免费）"
+  fi
+  # use_tempaddr 改动要新地址生成才生效，老临时地址自然过期
+  ok "v6 优化完成${bad:+（$bad 项被拒已注释）}: $V6_SYSCTL_FILE"
+  [ "${slaac:-0}" -gt 0 ] 2>/dev/null && info "已有临时地址会自然过期（几分钟），新连接即用稳定地址"
+  echo "  回滚: ./tune.sh v6 --rollback"
+}
+
 #── 菜单 ─────────────────────────────────────────────────────────────────────
 menu(){
   echo
@@ -605,11 +776,13 @@ menu(){
   echo "${C_BOLD}╚════════════════════════════════════════╝${C_0}"
   echo "  1) 一键调优（推荐，BDP 推导 + 确认式）"
   echo "  2) 一键调优（激进档）"
-  echo "  3) 查看状态"
-  echo "  4) 校验参数"
-  echo "  5) 回滚"
-  echo "  6) 安装 BBRv3 内核（可选，需重启）"
-  echo "  7) Skyline 加速（可选，高丢包普线专用，内核≥6.12）"
+  echo "  3) IPv6 专项（纯 v6 / 双栈机：出口稳定 + DNS + NAT64 提示）"
+  echo "  4) swap 兜底    小内存机推荐大小，回车即开（防 OOM 杀进程）"
+  echo "  5) 查看状态"
+  echo "  6) 校验参数"
+  echo "  7) 回滚"
+  echo "  8) 安装 BBRv3 内核（可选，需重启）"
+  echo "  9) Skyline 加速（可选，高丢包普线专用，内核≥6.12）"
   echo "  0) 退出"
   echo
   printf '选择: '
@@ -617,11 +790,13 @@ menu(){
   case "$sel" in
     1) cmd_apply ;;
     2) cmd_apply --aggressive ;;
-    3) cmd_status ;;
-    4) cmd_verify ;;
-    5) cmd_rollback ;;
-    6) cmd_kernel ;;
-    7) cmd_skyline ;;
+    3) cmd_v6 ;;
+    4) cmd_swap ;;
+    5) cmd_status ;;
+    6) cmd_verify ;;
+    7) cmd_rollback ;;
+    8) cmd_kernel ;;
+    9) cmd_skyline ;;
     *) exit 0 ;;
   esac
 }
@@ -633,6 +808,8 @@ case "${1:-menu}" in
   rollback) cmd_rollback ;;
   kernel)   cmd_kernel ;;
   skyline)  cmd_skyline ;;
+  swap)     cmd_swap ;;
+  v6)       case "${2:-}" in --rollback) v6_rollback ;; *) cmd_v6 ;; esac ;;
   menu|--menu|-m) menu ;;
   -h|--help|help)
     sed -n '2,32p' "$0" | grep -E '^#( |$)' | sed 's/^# \{0,1\}//' ;;

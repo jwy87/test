@@ -20,10 +20,15 @@
 #   ./bench.sh hw           仅硬件性能（CPU/内存/磁盘）
 #   ./bench.sh single       单线程双栈测速（自研，约 3 分钟）
 #   ./bench.sh all          体检全家桶：ip + net + single（推荐日常）
+#
+# 资源限额（应对 CPU/内存受限的 VPS，如 CPU 峰值≤30% 的套餐）：
+#   ./bench.sh --low-power full      限 CPU 25% + 内存 512MB 跑完全体
+#   MYVPS_CPU=30 MYVPS_MEM=400 ./bench.sh full    环境变量自定义限额
+#   环境变量 MYVPS_NOLIMIT=1 可彻底禁用所有限额（含默认 nice）
 #=============================================================================
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 WORKDIR="${BENCH_DIR:-$HOME/vps-bench}"
 mkdir -p "$WORKDIR"
 
@@ -42,6 +47,51 @@ is_root(){ [ "$(id -u)" = 0 ]; }
 
 banner(){ echo; echo "${C_BOLD}═══ VPS 综合测评 v$VERSION ═══${C_0}"; }
 
+#── 资源限额：应对"CPU 不能长时间超 30%"类套餐 ─────────────────────────────
+# 原理：systemd-run 事务性 cgroup（跑完自动清理，不残留系统状态）；
+#       无 systemd（老系统/容器）自动降级 nice+ionice（软限制）。
+# 注意：cgroup 限 CPU% 是对"本工具箱进程树"限，不影响系统其他服务。
+LOW_POWER="${MYVPS_LOW_POWER:-0}"
+CPU_LIMIT="${MYVPS_CPU:-25}"      # 百分比；MYVPS_CPU=50 → 50%
+MEM_LIMIT="${MYVPS_MEM:-512}"     # MB
+NO_LIMIT="${MYVPS_NOLIMIT:-0}"
+USE_SYSTEMD_RUN=0
+
+setup_limit(){
+  [ "$NO_LIMIT" = 1 ] && return 0
+  # --low-power 旗标或环境变量显式给限额才启用；默认只做 nice 10（几乎无副作用）
+  if [ "$LOW_POWER" != 1 ] && [ -z "${MYVPS_CPU:-}${MYVPS_MEM:-}" ]; then
+    renice -n 10 -p $$ >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+    USE_SYSTEMD_RUN=1
+    info "资源限额已启用（cgroup）: CPU≤${CPU_LIMIT}% 内存≤${MEM_LIMIT}MB"
+  else
+    renice -n 10 -p $$ >/dev/null 2>&1 || true
+    has ionice && ionice -c2 -n7 -p $$ >/dev/null 2>&1
+    warn "无 systemd，降级为软限制（nice 10 + 最低磁盘优先级）——CPU 峰值仍可能超，仅降低被杀概率"
+  fi
+}
+# wrap_run <命令...> — USE_SYSTEMD_RUN=1 时把整条命令包进 cgroup
+wrap_run(){
+  [ "$USE_SYSTEMD_RUN" = 1 ] || { "$@"; return $?; }
+  systemd-run --quiet --pipe --scope --collect \
+    --property=CPUQuota=${CPU_LIMIT}% \
+    --property=MemoryMax=$((MEM_LIMIT*1024*1024)) \
+    -- "$@"
+}
+
+#── 解析 --low-power 旗标（可出现在任意位置，剥掉后不传给子命令）──────────
+newargs=()
+for a in "$@"; do
+  case "$a" in
+    --low-power) LOW_POWER=1 ;;
+    *) newargs+=("$a") ;;
+  esac
+done
+[ ${#newargs[@]} -gt 0 ] && set -- "${newargs[@]}" || set --
+
 #── 网络助手：GitHub 直连失败自动换 spiritlhl CDN 镜像（格式：前缀+完整URL，已实测）──
 gh_fetch(){ # gh_fetch <github-url> <输出文件>
   local url="$1" out="$2"
@@ -55,6 +105,13 @@ gh_run(){ # gh_run <github-url> [参数...]  下载脚本到本地再执行（�
   local tmp; tmp=$(mktemp)
   gh_fetch "$url" "$tmp" || { rm -f "$tmp"; return 1; }
   bash "$tmp" "$@"; local rc=$?
+  rm -f "$tmp"; return $rc
+}
+gh_run_limited(){ # 同 gh_run，但包进资源限额 cgroup（--low-power 时实际生效）
+  local url="$1"; shift
+  local tmp; tmp=$(mktemp)
+  gh_fetch "$url" "$tmp" || { rm -f "$tmp"; return 1; }
+  wrap_run bash "$tmp" "$@"; local rc=$?
   rm -f "$tmp"; return $rc
 }
 
@@ -94,8 +151,8 @@ run_goecs(){ # run_goecs [额外开关...]
   install_goecs || die "goecs 不可用"
   local out="$WORKDIR/goecs-$(date +%Y%m%d-%H%M%S).log"
   info "运行 goecs（结果同时存 $out）..."
-  # 公共默认：中文 / 不上传 / 出日志
-  goecs -menu=false -l=zh -upload=false -log "$@" 2>&1 | tee "$out"
+  # 公共默认：中文 / 不上传 / 出日志；wrap_run = CPU/内存限额（--low-power 时启用）
+  wrap_run goecs -menu=false -l=zh -upload=false -log "$@" 2>&1 | tee "$out"
   ok "已保存: $out"
 }
 
@@ -104,7 +161,8 @@ run_ipq(){ # run_ipq [-4|-6]
   local out="$WORKDIR/ipq-$(date +%Y%m%d-%H%M%S).ansi"
   info "运行 IPQuality（隐私模式 -p，不上传）..."
   # 官方域名入口（与 NodeQuality 内部用法一致）；失败回退 raw 仓库路径（文件名 ip.sh）
-  bash <(curl -fsSL --max-time 60 https://IP.Check.Place) -y -p -l cn "$@" -o "$out" 2>&1 \
+  # IPQuality 是并行 curl 查询为主、CPU 占用低，限额只为保险统一走 wrap_run
+  wrap_run bash -c 'bash <(curl -fsSL --max-time 60 https://IP.Check.Place) "$@"' _ -y -p -l cn "$@" -o "$out" 2>&1 \
     || gh_run "https://raw.githubusercontent.com/xykt/IPQuality/main/ip.sh" -y -p -l cn "$@" -o "$out"
   [ -f "$out" ] && ok "报告已保存: $out" || warn "报告未生成（脚本可能改了输出路径）"
 }
@@ -153,7 +211,7 @@ iperf_try(){
   local fam="$1" host="$2" dir="$3" p out v
   for p in 5201 5202 5203 5204; do
     if [ "$dir" = up ]; then
-      out=$(iperf3 -"$fam" -c "$host" -p "$p" -P 1 -t 8 -f m 2>/dev/null)
+      out=$(wrap_run iperf3 -"$fam" -c "$host" -p "$p" -P 1 -t 8 -f m 2>/dev/null)
       v=$(echo "$out" | awk '$NF=="sender"{v=$(NF-3)} END{if(v!="") printf "%.1f", v}')
     else
       out=$(iperf3 -"$fam" -c "$host" -p "$p" -P 1 -t 8 -f m -R 2>/dev/null)
@@ -175,7 +233,7 @@ run_single_dual(){
 #── 模块 4: 流媒体解锁（RegionRestrictionCheck）──────────────────────────────
 run_media(){
   info "运行流媒体解锁检测（check.unlock.media）..."
-  gh_run "https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh" -M 0 2>/dev/null
+  gh_run_limited "https://raw.githubusercontent.com/lmc999/RegionRestrictionCheck/main/check.sh" -M 0 2>/dev/null
 }
 
 #── 组合 ─────────────────────────────────────────────────────────────────────
@@ -198,6 +256,9 @@ mode_media(){
 }
 mode_hw(){
   banner
+  if [ "$LOW_POWER" = 1 ] || [ -n "${MYVPS_CPU:-}${MYVPS_MEM:-}" ] && [ "$NO_LIMIT" != 1 ]; then
+    warn "限额模式下 CPU/内存跑分数字会偏低（受限是真实的，但分数不能与别人对比）"
+  fi
   run_goecs -backtrace=false -nt3=false -ping=false -speed=false -ut=false -email=false -security=false
 }
 mode_single(){
@@ -221,7 +282,14 @@ menu(){
   echo "  5) 仅流媒体解锁   Netflix/Disney+/AI 等（约 1 分钟）"
   echo "  6) 仅硬件性能     CPU/内存/磁盘（约 5 分钟）"
   echo "  7) 单线程双栈测速 iperf3 收/发（约 3 分钟）"
-  echo "  0) 退出"
+  if [ "$LOW_POWER" = 1 ]; then
+    echo
+    echo "  ${C_G}[限额模式]${C_0} CPU≤${CPU_LIMIT}% 内存≤${MEM_LIMIT}MB（应对受限套餐）"
+  else
+    echo
+    echo "  ${C_D}受限套餐（CPU 峰值受限/小内存）？加 --low-power 限额运行:${C_0}"
+    echo "  ${C_D}  ./bench.sh --low-power full    或自定义: MYVPS_CPU=30 MYVPS_MEM=400 ./bench.sh full${C_0}"
+  fi
   echo
   printf '选择: '
   read -r sel || exit 0
@@ -236,6 +304,8 @@ menu(){
     *) exit 0 ;;
   esac
 }
+
+setup_limit
 
 case "${1:-menu}" in
   full)    mode_full ;;

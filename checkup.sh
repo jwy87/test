@@ -107,17 +107,80 @@ kv "负载" "$LOAD"
 kv "已运行" "$UPTIME"
 j "{\"section\":\"system\",\"os\":\"$OS_PRETTY\",\"kernel\":\"$(uname -r)\",\"virt\":\"$KV_VIRT\",\"ram_mb\":$RAM}"
 
+# fetch_ip <4|6> — 双源双栈取公网出口 IP（api.ip.sb 双栈直连 → 降级源）
+fetch_ip(){
+  local fam="$1"
+  curl -"$fam" -s --max-time 5 https://api.ip.sb/ip 2>/dev/null && return 0
+  if [ "$fam" = 4 ]; then
+    curl -4 -s --max-time 5 http://ip-api.com/line?fields=query 2>/dev/null
+  else
+    curl -6 -s --max-time 5 http://ip.sb 2>/dev/null
+  fi
+}
+
 #── 2. 网络接口与 IP 双栈 ────────────────────────────────────────────────────
 sec "IP 双栈"
 V4=""; V6=""
 if has curl; then
-  V4=$(curl -4 -s --max-time 5 https://api.ip.sb/ip 2>/dev/null || curl -4 -s --max-time 5 http://ip-api.com/line?fields=query 2>/dev/null)
-  V6=$(curl -6 -s --max-time 5 https://api.ip.sb/ip 2>/dev/null)
+  V4=$(fetch_ip 4)
+  V6=$(fetch_ip 6)
 fi
-[ -n "$V4" ] && kv "IPv4 出口" "$V4" || kv "IPv4 出口" "${C_R}无/失败${C_0}"
+[ -n "$V4" ] && kv "IPv4 出口" "$V4" || kv "IPv4 出口" "${C_D}无${C_0}"
 [ -n "$V6" ] && kv "IPv6 出口" "$V6" || kv "IPv6 出口" "${C_D}无${C_0}"
-kv "双栈" "$([ -n "$V4" ] && [ -n "$V6" ] && echo "${C_G}完整双栈${C_0}" || echo "单栈")"
+if [ -n "$V4" ] && [ -n "$V6" ]; then
+  kv "双栈" "${C_G}完整双栈${C_0}"
+elif [ -n "$V6" ]; then
+  kv "双栈" "${C_G}纯 IPv6 机器${C_0}"
+else
+  kv "双栈" "单栈"
+fi
 j "{\"section\":\"ip\",\"ipv4\":\"${V4:-null}\",\"ipv6\":\"${V6:-null}\"}"
+
+#── 2.5 IPv6 深度体检（纯 v6 或双栈都看）──────────────────────────────────────
+if [ -n "$V6" ] || ip -6 route show default 2>/dev/null | grep -q .; then
+  sec "IPv6 体检"
+  # 地址与路由
+  if has ip; then
+    V6_LL=$(ip -6 addr show scope link 2>/dev/null | grep -c 'inet6')
+    V6_GUA=$(ip -6 addr show scope global 2>/dev/null | grep 'inet6' | awk '{print $2}' | head -3)
+    V6_GUA_N=$(ip -6 addr show scope global 2>/dev/null | grep -c 'inet6')
+    kv "全局地址数" "$V6_GUA_N（$([ "$V6_GUA_N" -gt 1 ] && echo 多地址可用 || echo 单地址)）"
+    [ "$V6_GUA_N" -gt 1 ] && kv "地址列表" "$(echo "$V6_GUA" | tr '\n' ' ')"
+    kv "默认路由" "$(ip -6 route show default 2>/dev/null | head -1 || echo 无)"
+    # SLAAC / DHCPv6 判定：地址带动态标记（mngtmpaddr/临时地址）= SLAAC
+    V6_SLAAC=$(ip -6 addr show scope global 2>/dev/null | grep -c 'mngtmpaddr\|dynamic')
+    [ "$V6_SLAAC" -gt 0 ] && kv "地址来源" "SLAAC（路由器自动分配）" || kv "地址来源" "静态/DHCPv6"
+  fi
+  # 出口连通性：对多个 v6 目标（接口可达≠真通公网）
+  if has ping; then
+    V6_OK=0
+    for t in 240c::6666 2001:4860:4860::8888 2620:fe::fe; do
+      ping -6 -c 1 -W 3 "$t" >/dev/null 2>&1 && { V6_OK=1; break; }
+    done
+    [ "$V6_OK" = 1 ] && kv "公网连通" "${C_G}通${C_0}" || kv "公网连通" "${C_R}不通（有地址无路由?）${C_0}"
+    [ "$V6_OK" != 1 ] && warn "IPv6 有地址但公网不通：查 ip -6 route、防火墙、上游 RA"
+  fi
+  # DNS v6 解析能力（curl 检测源可能只查 AAAA）
+  if has getent; then
+    AAAA=$(getent ahosts v6.test-ipv6.com 2>/dev/null | head -1 | awk '{print $1}')
+    kv "AAAA 解析" "$([ -n "$AAAA" ] && echo "${C_G}正常${C_0}" || echo "${C_Y}失败${C_0}")"
+  fi
+  # 隐私扩展 / 临时地址（影响出口 IP 稳定性，代理节点需要稳定出口）
+  if [ -d /proc/sys/net/ipv6/conf ]; then
+    PRIV=$(cat /proc/sys/net/ipv6/conf/all/use_tempaddr 2>/dev/null)
+    case "${PRIV:-}" in
+      0) kv "隐私扩展" "关（出口 IP 稳定 ✅ 节点机推荐）";;
+      1|2) kv "隐私扩展" "开（临时地址轮换，出口 IP 会变，代理节点建议关: tune.sh v6）";;
+      *) kv "隐私扩展" "未知（$PRIV）";;
+    esac
+  fi
+  # MTU（v6 隧道常见 1280，影响大包）
+  if has ip; then
+    V6_MTU=$(ip -6 link show 2>/dev/null | grep -o 'mtu [0-9]*' | sort -u | tail -1 | awk '{print $2}')
+    [ -n "$V6_MTU" ] && kv "MTU" "$V6_MTU$([ "$V6_MTU" -lt 1500 ] && echo " ${C_Y}(隧道环境，tune.sh v6 会开 mtu_probing)${C_0}")"
+  fi
+  j "{\"section\":\"ipv6\",\"gua\":${V6_GUA_N:-0},\"public_reachable\":${V6_OK:-0},\"tempaddr\":${PRIV:-null},\"mt\":${V6_MTU:-null}}"
+fi
 
 #── 3. BBR / 拥塞控制状态 ────────────────────────────────────────────────────
 sec "拥塞控制"
@@ -157,6 +220,9 @@ j "{\"section\":\"cc\",\"algorithm\":\"$CC\",\"qdisc\":\"$QD\",\"bbr_version\":\
 #── 4. 大陆三网延迟 ──────────────────────────────────────────────────────────
 if [ "$DO_PING" = 1 ]; then
   sec "大陆三网延迟（ICMP ×$PING_COUNT，单位 ms）"
+  if ! ip -4 route show default 2>/dev/null | grep -q . && [ -z "$V4" ]; then
+    warn "无 IPv4 路由，跳过 v4 表（纯 v6 机器）"
+  else
   printf '  %-14s %-10s %-10s %-10s\n' "" "北京" "上海" "广州"
   for isp in CT CU CM; do
     case $isp in
@@ -172,6 +238,7 @@ if [ "$DO_PING" = 1 ]; then
       "$([ -n "$sh" ] && echo "${sh}ms" || echo "-")" \
       "$([ -n "$gz" ] && echo "${gz}ms" || echo "-")"
   done
+  fi
   # IPv6（有 v6 才测）
   if [ -n "$V6" ]; then
     echo "  ${C_D}── IPv6 ──${C_0}"
