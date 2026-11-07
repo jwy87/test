@@ -9,6 +9,7 @@
 #   ./vps.sh tune       网络调优（BBR/fq/BDP 缓冲/initcwnd，含回滚）
 #   ./vps.sh secure     安全加固（一键：更新+防爆破+SSH加固，不锁门）
 #   ./vps.sh kernel     可选：安装 BBRv3 内核（需重启）
+#   ./vps.sh skyline    可选：Skyline 加速（高丢包普线，内核≥6.12，无需重启）
 #   ./vps.sh check      60 秒体检
 #   ./vps.sh net        三网延迟矩阵 + 回程线路
 #   ./vps.sh home [省]  到你省份的三网延迟（自动识别/手动指定，31 省全支持）
@@ -172,7 +173,8 @@ menu(){
   echo
   echo "  ${C_BOLD}进阶${C_0}"
   echo "   8) BBRv3 内核    可选安装（需重启，先看说明）"
-  echo "   9) 装为系统命令  vps"
+  echo "   9) Skyline 加速  高丢包普线专用（内核≥6.12，无需重启）"
+  echo "  10) 装为系统命令  vps"
   echo "   0) 退出"
   echo
   printf '选择: '
@@ -186,7 +188,8 @@ menu(){
     6) run_mod nettest.sh ;;
     7) run_mod nettest.sh home ;;
     8) run_mod tune.sh kernel ;;
-    9) mode_install ;;
+    9) run_mod tune.sh skyline ;;
+    10) mode_install ;;
     *) exit 0 ;;
   esac
   done
@@ -205,6 +208,7 @@ case "$CMD" in
   tune)      run_mod tune.sh "${@:2}" ;;
   secure)    run_mod secure.sh "${@:2}" ;;
   kernel)    run_mod tune.sh kernel ;;
+  skyline)   run_mod tune.sh skyline ;;
   check)     run_mod checkup.sh "${@:2}" ;;
   net)       run_mod nettest.sh "${@:2}" ;;
   home)      run_mod nettest.sh home "${@:2}" ;;

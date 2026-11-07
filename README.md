@@ -57,7 +57,7 @@ bash ~/.myvps/vps.sh install   # 装为系统命令，以后直接敲: vps
 | 文件 | 功能 | 改系统？ | 耗时 |
 |---|---|---|---|
 | `vps.sh` | 统一入口菜单（也可直接跑下面五个） | - | - |
-| `tune.sh` | 网络调优：BBR/fq/BDP 缓冲/initcwnd，快照+回滚 | ✅（可回滚） | 1-2 分钟 |
+| `tune.sh` | 网络调优：BBR/fq/BDP 缓冲/initcwnd + 可选 Skyline/BBRv3 内核 | ✅（可回滚） | 1-2 分钟 |
 | `secure.sh` | 安全加固：更新/防爆破/SSH 加固，事务式改配置 | ✅（可回滚） | 2-5 分钟 |
 | `checkup.sh` | 60 秒体检：系统/IP双栈/BBR/三网延迟/健康 | ❌ 只读 | 30-60 秒 |
 | `nettest.sh` | 三网延迟矩阵（京沪穗蓉 v4+v6）+ 回程线路判定 | ❌（装 backtrace 到 /usr/local/bin） | 1-2 分钟 |
@@ -92,6 +92,7 @@ bash tune.sh status             # 看当前状态
 bash tune.sh verify             # 校验参数是否生效
 bash tune.sh rollback           # 一键回滚到调优前
 bash tune.sh kernel             # 可选：装 BBRv3 内核（见下文）
+bash tune.sh skyline            # 可选：Skyline 加速（见下文）
 ```
 
 **它做了什么**（全部写入 `/etc/sysctl.d/99-myvps-tune.conf`，逐项试写、不支持自动注释）：
@@ -211,6 +212,23 @@ bash secure.sh rollback     # 回滚对 SSH 的全部修改
 
 装完重启后用 `cat /sys/module/tcp_bbr/version` 验证（v3 树会输出 `3`，主线 v1 无输出）。
 
+## Skyline Speeder：高丢包普线的可选加速（2026-11 核实）
+
+**它是什么**：eBPF 拥塞控制（内核 ≥ 6.12），接管 VPS 的 TCP 发送端。专治**随机丢包 10-30%、RTT 100-300ms** 的跨境普线（163/4837 晚高峰）——丢包不降速，按实测带宽发送，真堵了（延迟涨/ECN 标记）才刹车。客户端什么都不用装。上游 [CYBERVERSE-Research/skyline-speeder](https://github.com/CYBERVERSE-Research/skyline-speeder)（GPL-2.0，2026-10 核实活跃，206 star）。
+
+| 和谁比 | 优势 |
+|---|---|
+| vs BBR | BBR 在 10-20% 随机丢包下速度明显下降；Skyline 丢包不降速（100M 链路 RTT100ms/丢 20%：BBR 3.5M → Skyline 95M，上游实测） |
+| vs tcp-brutal | 不用手填带宽（自动估计）；有拥塞自保护；eBPF 加载前过内核检查（brutal 是 DKMS 内核模块） |
+
+**适用判断**（tune.sh skyline 菜单里也有同样的引导）：
+
+- ✅ 回程 163/4837 普线、晚高峰卡（`vps.sh net` 查回程）+ 内核 ≥ 6.12（Debian 13 自带；Debian 12 / Ubuntu 22.04/24.04 都不够）
+- ❌ GIA/9929/CMIN2 优质线路——不怎么丢包，BBR 就够
+- ❌ 丢包是 VPS 出口自身拥塞（排队溢出）——用了反而更慢
+
+**与本工具箱的配合**（tune.sh 已内置，无需操心）：Skyline 启用时接管 CC/qdisc 并守住设置；tune.sh 检测到 `ACCELERATING` 状态会自动跳过 CC/qdisc 项（缓冲区 BDP 推导、initcwnd 等其余调优照常叠加），verify 也不误报。一键卸载后重跑 `tune.sh apply --force` 即恢复 bbr+fq。装完只对新连接生效，测试记得重连。
+
 ## 回滚
 
 ```bash
@@ -243,6 +261,7 @@ bash tune.sh rollback   # 恢复全部 sysctl 快照 + initcwnd 默认 + 删配�
 - [xykt/IPQuality](https://github.com/xykt/IPQuality) — IP 质量体检
 - [nxtrace/NTrace-core](https://github.com/nxtrace/NTrace-core) — NextTrace
 - [byJoey/Actions-bbr-v3](https://github.com/byJoey/Actions-bbr-v3)、[XanMod](https://xanmod.org/) — BBRv3 内核
+- [CYBERVERSE-Research/skyline-speeder](https://github.com/CYBERVERSE-Research/skyline-speeder) — eBPF 拥塞控制（高丢包普线加速，2026-10 核实活跃）
 - [lmc999/RegionRestrictionCheck](https://github.com/lmc999/RegionRestrictionCheck) — 流媒体解锁
 - [tansir-1/vps-security-bootstrap](https://github.com/tansir-1/vps-security-bootstrap) v10.1.0 — SSH 事务备份/校验/回滚与验证门模式（SHA256 核对后源码级参考）
 - [gnafehefang/VPS-QuickSetup](https://github.com/gnafehefang/VPS-QuickSetup) — 双端口过渡、新窗口验证流程

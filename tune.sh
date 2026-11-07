@@ -11,6 +11,8 @@
 #   4. 刻意不设 tcp_notsent_lowat：社区两派分歧（降延迟 vs 拖慢长距起步），
 #      默认不动它。
 #   5. OpenVZ/LXC 共享内核：只做 sysctl（宿主允许时），不碰内核。
+#   6. Skyline Speeder（eBPF CC，内核≥6.12）与本脚本是两套系统：它启用时会
+#      接管拥塞控制；本脚本检测到它就不再碰 CC 项，互不打架（见 cmd_skyline）。
 #
 # 用法：
 #   ./tune.sh                 交互式菜单（推荐）
@@ -21,6 +23,7 @@
 #   ./tune.sh status          查看当前调优状态
 #   ./tune.sh rollback        回滚到调优前快照
 #   ./tune.sh kernel          可选：安装 BBRv3 内核（明确提示需重启）
+#   ./tune.sh skyline         可选：Skyline Speeder 高丢包线路加速（eBPF，需内核≥6.12）
 #   ./tune.sh verify          校验当前参数是否生效
 #=============================================================================
 set -uo pipefail
@@ -71,6 +74,12 @@ bbr_version(){
 
 cc_current(){ sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null; }
 qdisc_current(){ sysctl -n net.core.default_qdisc 2>/dev/null; }
+
+# Skyline Speeder（eBPF CC）是否正在接管：ssctl 存在且状态含 ACCELERATING
+skyline_is_on(){
+  command -v ssctl >/dev/null 2>&1 || return 1
+  ssctl status 2>/dev/null | grep -q 'ACCELERATING'
+}
 
 # 从 SSH 连接目标实测 RTT；连不上/无 ping 返回默认 180ms（跨海典型值）
 guess_rtt(){
@@ -189,6 +198,7 @@ cmd_rollback(){
   rm -rf "$STATE_DIR"
   ok "已回滚 $n 项参数；initcwnd 已处理；配置文件已删除"
   warn "tcp_mem 等部分参数回滚后建议重启一次以彻底还原"
+  skyline_is_on && warn "Skyline Speeder 仍在接管 CC（与本次回滚无关）；要一并卸载: ./tune.sh skyline 选卸载"
 }
 
 #── 应用调优 ─────────────────────────────────────────────────────────────────
@@ -228,7 +238,10 @@ cmd_apply(){
     exp_rmem=$(grep -m1 '^net.core.rmem_max' "$SYSCTL_FILE" | awk '{print $3}')
     cur_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
     cur_rmem=$(sysctl -n net.core.rmem_max 2>/dev/null)
-    [ -n "$exp_cc" ] && [ "$exp_cc" != "$cur_cc" ] && drift=1
+    # Skyline 接管时 CC 必然不等于配置值，属预期，不算漂移
+    if ! skyline_is_on; then
+      [ -n "$exp_cc" ] && [ "$exp_cc" != "$cur_cc" ] && drift=1
+    fi
     [ -n "$exp_rmem" ] && [ "$exp_rmem" != "$cur_rmem" ] && drift=1
     # initcwnd 是运行时设置，重启即丢（属正常）
     if ! is_container && ip route show default 2>/dev/null | head -1 | grep -q 'initcwnd'; then :; else ic_lost=1; fi
@@ -273,8 +286,7 @@ cmd_apply(){
   local bdp buf_max tcp_mem
   bdp=$(calc_bdp "$bw" "$rtt")
   buf_max=$(calc_buf_max "$bdp" "$ram")
-  tcp_mem=$(calc_tcp_mem "$ram")
-  # 激进档：缓冲上限 ×2（仍受内存/32 封顶约束，只对小 BDP 机器有感）
+  tcp_mem=$(calc_tcp_mem "$ram")  # 激进档：缓冲上限 ×2（仍受内存/32 封顶约束，只对小 BDP 机器有感）
   [ "$aggressive" = 1 ] && buf_max=$(calc_buf_max "$((bdp*2))" "$ram")
   # Hysteria2 官方要求 rmem/wmem_max ≥ 16MB（QUIC/UDP）；内存 ≥1GB 的机器保底 16MB
   if [ "$ram" -ge 1024 ] && [ "$buf_max" -lt 16777216 ]; then
@@ -292,24 +304,33 @@ cmd_apply(){
   printf '  %-14s %s\n' "tcp_mem" "$(echo "$tcp_mem" | awk '{printf "%dM/%dM/%dM", $1*4/1024, $2*4/1024, $3*4/1024}')"
   [ "$aggressive" = 1 ] && warn "激进档：缓冲上限翻倍（仅大带宽跨海线路有感）"
 
+  #── 拥塞控制：Skyline 启用中则整段让位（它接管 CC，且会守住设置）──────────
+  if skyline_is_on; then
+    warn "Skyline Speeder 正在加速（ACCELERATING）：跳过本脚本的 CC/qdisc 项，缓冲区等其余调优照常"
+    local cc=""   # 空 = 不写 CC/qdisc 两行
+  else
   #── 拥塞控制：有 bbr 用 bbr，没有用 cubic（不装内核不吹 BBRv3）──
   local cc=bbr
   modprobe tcp_bbr 2>/dev/null || true
   has_word(){ case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
   has_word "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null)" bbr \
     || { warn "内核无 BBR，回退 cubic（换 BBRv3 内核见: ./tune.sh kernel）"; cc=cubic; }
+  fi  # skyline_is_on 结束
 
   take_snapshot
 
   #── 写配置（临时文件 + 原子替换，逐项校验，拒绝的自动注释）────────────────
   local tmp; tmp=$(mktemp "${SYSCTL_FILE}.XXXXXX") || die "无法创建临时文件（磁盘满/只读?）"
+  # Skyline 让位时 CC/qdisc 两行整段不写（写空值会报错，注释行不参与试写）
+  local cc_block="net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = $cc"
+  [ -z "$cc" ] && cc_block="# Skyline Speeder 启用中：CC/qdisc 由它接管，本文件不设（卸载后重跑 apply 恢复 bbr+fq）"
   if ! cat > "$tmp" <<EOF
 # 由 myvps tune v$VERSION 生成 $(date '+%F %T')
-# 带宽=${bw}Mbps RTT=${rtt}ms 内存=${ram}MB CC=${cc}
+# 带宽=${bw}Mbps RTT=${rtt}ms 内存=${ram}MB CC=${cc:-由Skyline接管}
 # 重新生成: ./tune.sh apply [--bw N --rtt N]
 
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
+$cc_block
 
 # —— TCP/UDP 缓冲区（BDP 推导；rmem/wmem ≥16MB 同时满足 Hysteria2 官方要求）——
 net.core.rmem_max = $buf_max
@@ -400,6 +421,13 @@ cmd_status(){
     "qdisc" "$(qdisc_current)"
   local bv; bv=$(bbr_version)
   printf '  %-22s %s\n' "BBR 版本" "${bv:-v1或未加载}"
+  if command -v ssctl >/dev/null 2>&1; then
+    if skyline_is_on; then
+      printf '  %-22s %s\n' "Skyline Speeder" "ACCELERATING（接管中，CC 由它管）"
+    else
+      printf '  %-22s %s\n' "Skyline Speeder" "已安装未加速（ssctl status 查看）"
+    fi
+  fi
   if [ -f "$SYSCTL_FILE" ]; then
     echo "  配置文件: $SYSCTL_FILE"
     grep -v '^#' "$SYSCTL_FILE" | grep '=' | while IFS= read -r l; do
@@ -420,8 +448,13 @@ cmd_verify(){
     else warn "  $1 = $2（期望 $3）"; fail=$((fail+1)); fi
   }
   echo "${C_BOLD}── 参数校验 ──${C_0}"
-  check "拥塞控制" "$(cc_current)" "$(grep '^net.ipv4.tcp_congestion_control' "$SYSCTL_FILE" 2>/dev/null | awk '{print $3}')"
-  check "qdisc" "$(qdisc_current)" "$(grep '^net.core.default_qdisc' "$SYSCTL_FILE" 2>/dev/null | awk '{print $3}')"
+  if skyline_is_on; then
+    ok "  拥塞控制 = $(cc_current)（Skyline Speeder 接管中，本脚本不校验此项）"
+    pass=$((pass+1))
+  else
+    check "拥塞控制" "$(cc_current)" "$(grep '^net.ipv4.tcp_congestion_control' "$SYSCTL_FILE" 2>/dev/null | awk '{print $3}')"
+    check "qdisc" "$(qdisc_current)" "$(grep '^net.core.default_qdisc' "$SYSCTL_FILE" 2>/dev/null | awk '{print $3}')"
+  fi
   check "rmem_max" "$(sysctl -n net.core.rmem_max 2>/dev/null)" "$(grep '^net.core.rmem_max' "$SYSCTL_FILE" 2>/dev/null | awk '{print $3}')"
   check "slow_start_after_idle" "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null)" "0"
   check "mtu_probing" "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null)" "1"
@@ -500,6 +533,70 @@ cmd_kernel(){
   esac
 }
 
+#── 可选：Skyline Speeder 高丢包线路加速（eBPF，无需重启）────────────────────
+# 上游: github.com/CYBERVERSE-Research/skyline-speeder（GPL-2.0，2026-10 核实活跃）
+# 定位: 内核≥6.12 的 VPS，晚高峰丢包 10-30% 的普线（163/4837）效果最明显；
+#       它自动估带宽（不像 tcp-brutal 要手填），有拥塞护栏（延迟+ECN），可一键卸载
+cmd_skyline(){
+  need_root
+  echo "${C_BOLD}── Skyline Speeder 高丢包线路加速（可选） ──${C_0}"
+  echo
+  echo "  它是什么：eBPF 拥塞控制，接管本机 TCP 发送端。专治${C_BOLD}随机丢包 10-30%、RTT 100-300ms${C_0}"
+  echo "  的跨境普线（163/4837 晚高峰）——丢包不降速，按实测带宽发送，真堵了（延迟涨/ECN）才刹车。"
+  echo "  客户端什么都不用装。比 tcp-brutal 省心：不用手填带宽；比 BBR 抗丢包。"
+  echo
+  echo "  ${C_Y}先判断适不适合你：${C_0}"
+  echo "  ✅ 回程是 163/4837 普线，晚高峰卡（nettest.sh route 可查回程）"
+  echo "  ✅ 内核 ≥ 6.12（Debian 13 自带；Debian 12 / Ubuntu 22.04/24.04 自带的都不够，先 ./tune.sh kernel 或换系统）"
+  echo "  ❌ GIA/9929/CMIN2 优质线路——不怎么丢包，BBR 就够，没必要"
+  echo "  ❌ 丢包是 VPS 出口自身拥塞（自己发太猛排队溢出）——用了反而更慢"
+  echo
+  # 环境预检
+  is_container && { warn "容器环境（$(detect_virt)）：Skyline 需要 eBPF struct_ops，共享内核装不了"; return 1; }
+  local kmaj; kmaj=$(uname -r | cut -d. -f1-2 | awk -F. '{print $1*1000+$2}')
+  [ "$kmaj" -ge 6012 ] 2>/dev/null \
+    || { warn "内核 $(uname -r) < 6.12，不满足要求（BBRv3 内核也不够新时需换 Debian 13 / 手动升内核）"; return 1; }
+  if skyline_is_on; then
+    ok "Skyline 已在加速中（ACCELERATING）"
+    echo "  看加速中的连接: sudo ssctl flows    暂停: sudo ssctl drain    卸载: 见下方选项"
+    printf '%s 要卸载吗? [y/N] '
+    read -r ans || ans=n
+    case "$ans" in
+      [Yy]*)
+        curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh \
+          | bash -s -- --uninstall \
+          && { ok "已卸载，切回 bbr + fq"; info "重跑 ./tune.sh apply --force 恢复本工具箱的 CC 设置"; } \
+          || warn "卸载失败（网络?），可手动重试或看上游文档"
+        ;;
+      *) info "保持现状";;
+    esac
+    return 0
+  fi
+
+  echo "  装完即时生效（无需重启），${C_Y}只对新连接生效${C_0}——测试时记得重新连接"
+  echo "  一键卸载随时可退：切回 bbr + fq，不留后台"
+  echo
+  printf '%s 安装 Skyline Speeder? [y/N] '
+  read -r ans || ans=n
+  case "$ans" in
+    [Yy]*) ;;
+    *) info "已取消（GIA 等优质线路用户不需要它）"; return 0 ;;
+  esac
+  info "运行上游官方安装器（预编译包，无需编译工具；失败自动改源码构建）..."
+  curl -fsSL https://raw.githubusercontent.com/CYBERVERSE-Research/skyline-speeder/main/scripts/bootstrap.sh | bash \
+    || die "安装器执行失败（网络?）——可先看脚本再装: git clone https://github.com/CYBERVERSE-Research/skyline-speeder.git"
+  echo
+  if skyline_is_on; then
+    ok "Skyline 已接管本机新连接（ACCELERATING）"
+  else
+    warn "已安装但未见 ACCELERATING 状态，运行 sudo ssctl status 看第一行："
+    echo "    ATTACHED, NOT DEFAULT / STANDBY → 执行: sudo ssctl enable"
+  fi
+  echo
+  echo "  ${C_BOLD}与本工具箱的关系${C_0}：它接管 CC/qdisc，tune.sh 检测到它会自动跳过这两项，"
+  echo "  缓冲区（BDP）/initcwnd 等其余调优照常叠加生效。卸载它后重跑 ./tune.sh apply 恢复 bbr+fq。"
+}
+
 #── 菜单 ─────────────────────────────────────────────────────────────────────
 menu(){
   echo
@@ -512,6 +609,7 @@ menu(){
   echo "  4) 校验参数"
   echo "  5) 回滚"
   echo "  6) 安装 BBRv3 内核（可选，需重启）"
+  echo "  7) Skyline 加速（可选，高丢包普线专用，内核≥6.12）"
   echo "  0) 退出"
   echo
   printf '选择: '
@@ -523,6 +621,7 @@ menu(){
     4) cmd_verify ;;
     5) cmd_rollback ;;
     6) cmd_kernel ;;
+    7) cmd_skyline ;;
     *) exit 0 ;;
   esac
 }
@@ -533,8 +632,9 @@ case "${1:-menu}" in
   verify)   cmd_verify ;;
   rollback) cmd_rollback ;;
   kernel)   cmd_kernel ;;
+  skyline)  cmd_skyline ;;
   menu|--menu|-m) menu ;;
   -h|--help|help)
-    sed -n '2,30p' "$0" | grep -E '^#( |$)' | sed 's/^# \{0,1\}//' ;;
+    sed -n '2,32p' "$0" | grep -E '^#( |$)' | sed 's/^# \{0,1\}//' ;;
   *) die "未知子命令: $1（see --help）" ;;
 esac
