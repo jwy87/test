@@ -24,7 +24,7 @@
 #=============================================================================
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 #── 仓库地址：上传 GitHub 后改成你的（公共仓库，main 分支）──────────────────
 # 也可不改文件、用环境变量临时指定：export MYVPS_REPO=https://raw.githubusercontent.com/<用户>/<仓库>/main
@@ -153,10 +153,24 @@ mode_update(){
   info "更新模块: $REPO_BASE"
   local m fail=0
   for m in $MODULES; do
-    if dl "$REPO_BASE/$m" "$HOME_DIR/$m.new"; then mv -f "$HOME_DIR/$m.new" "$HOME_DIR/$m"
-    else rm -f "$HOME_DIR/$m.new"; fail=1; fi
+    local old_v="" new_v=""
+    old_v=$(grep -m1 '^VERSION=' "$HOME_DIR/$m" 2>/dev/null | cut -d'"' -f2)
+    if dl "$REPO_BASE/$m" "$HOME_DIR/$m.new"; then
+      new_v=$(grep -m1 '^VERSION=' "$HOME_DIR/$m.new" 2>/dev/null | cut -d'"' -f2)
+      mv -f "$HOME_DIR/$m.new" "$HOME_DIR/$m"
+      if [ -n "$old_v" ] && [ -n "$new_v" ] && [ "$old_v" = "$new_v" ]; then
+        printf '  %s %s（v%s，无变化）\n' "${C_G}✓${C_0}" "$m" "$new_v"
+      else
+        printf '  %s %s（v%s ← %s）\n' "${C_G}✓${C_0}" "$m" "${new_v:-?}" "${old_v:-无}"
+      fi
+    else
+      rm -f "$HOME_DIR/$m.new"; fail=1
+      printf '  %s %s（下载失败，保留 v%s）\n' "${C_R}✗${C_0}" "$m" "${old_v:-?}"
+    fi
   done
-  [ "$fail" = 0 ] && ok "已更新到最新" || warn "部分文件更新失败（网络），已保留旧版"
+  # GitHub raw 有 ~5 分钟 CDN 缓存：刚 push 完可能拉到旧版，看到"无变化"稍等再更
+  [ "$fail" = 0 ] && ok "更新完成（若刚 push，raw 缓存约 5 分钟，版本没变就等会再跑）" \
+                   || warn "部分文件更新失败（网络），已保留旧版"
 }
 
 #── 菜单 ─────────────────────────────────────────────────────────────────────

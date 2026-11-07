@@ -18,7 +18,7 @@
 #=============================================================================
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 BIN_DIR="/usr/local/bin"
 NODES_URL="https://raw.githubusercontent.com/spiritLHLS/icmp_targets/main/nodes.json"
 

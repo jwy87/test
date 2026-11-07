@@ -30,7 +30,7 @@
 #=============================================================================
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 STATE_DIR="/var/lib/myvps-tune"
 SNAPSHOT="$STATE_DIR/pre-tune.snapshot"
 SYSCTL_FILE="/etc/sysctl.d/99-myvps-tune.conf"
